@@ -1,0 +1,8 @@
+node_modules
+dist
+dev-dist
+.DS_Store
+*.local
+.venv
+__pycache__
+tools/shard/out

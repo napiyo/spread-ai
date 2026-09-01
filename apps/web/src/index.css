@@ -1,0 +1,116 @@
+@import "tailwindcss";
+
+/* ── spreadAI design tokens ──────────────────────────────────────────────
+   Dark-first, near-black, one gradient accent (cyan → violet). The accent is
+   reserved for things that are *live*: measured numbers, active beams, the
+   device that is currently generating. Everything else is greyscale so the
+   accent always means something.
+   ------------------------------------------------------------------------ */
+@theme {
+  --color-void: #08080b;
+  --color-ink: #0d0d12;
+  --color-panel: #121218;
+  --color-line: #1e1e27;
+  --color-line-bright: #2c2c38;
+
+  --color-mute: #6b6b7b;
+  --color-dim: #9a9aac;
+  --color-fore: #e8e8f0;
+
+  --color-cy: #34e5ff;
+  --color-vi: #7c5cff;
+  --color-lime: #9dff5c;
+  --color-amber: #ffb84d;
+  --color-rose: #ff5c8a;
+
+  --font-sans: "Inter var", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+
+  --radius-xs: 6px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-xl: 28px;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@layer base {
+  * { border-color: var(--color-line); }
+
+  html {
+    background: var(--color-void);
+    color-scheme: dark;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-void);
+    color: var(--color-fore);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior-y: none;
+  }
+
+  ::selection { background: color-mix(in oklab, var(--color-vi) 40%, transparent); }
+
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line-bright);
+    border-radius: 99px;
+    border: 3px solid var(--color-void);
+  }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  /* Motion is meaning here, but never at the cost of accessibility. Every
+     component also checks this via useReducedMotion; this is the backstop. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@utility text-gradient {
+  background-image: linear-gradient(100deg, var(--color-cy), var(--color-vi));
+  background-clip: text;
+  color: transparent;
+}
+
+@utility panel {
+  background: color-mix(in oklab, var(--color-panel) 70%, transparent);
+  border: 1px solid var(--color-line);
+  backdrop-filter: blur(12px);
+}
+
+/* Grid backdrop used behind the hero and the fleet graph. */
+@utility grid-field {
+  background-image:
+    linear-gradient(to right, color-mix(in oklab, var(--color-line) 70%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in oklab, var(--color-line) 70%, transparent) 1px, transparent 1px);
+  background-size: 56px 56px;
+}
+
+/* While the GPU benchmark runs, every decorative animation stops so it is not
+   measuring itself. See capability/bench.ts. */
+html[data-benching] .sai-decor,
+html[data-benching] .sai-decor * {
+  animation-play-state: paused !important;
+}
+
+@keyframes sai-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes sai-pulse-ring {
+  0% { transform: scale(0.9); opacity: 0.55; }
+  70% { transform: scale(1.6); opacity: 0; }
+  100% { transform: scale(1.6); opacity: 0; }
+}

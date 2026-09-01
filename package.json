@@ -1,0 +1,14 @@
+{
+  "name": "spreadai",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/web", "server/signal"],
+  "scripts": {
+    "dev": "npm run dev -w apps/web",
+    "dev:signal": "npm run dev -w server/signal",
+    "build": "npm run build -w apps/web",
+    "preview": "npm run preview -w apps/web",
+    "test": "npm run test -w apps/web",
+    "typecheck": "npm run typecheck -w apps/web"
+  }
+}
