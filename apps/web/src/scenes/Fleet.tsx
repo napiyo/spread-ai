@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import {
-  Copy, Laptop, Link2, LogOut, Monitor, Radio, Smartphone, Tablet, Users, Wifi, WifiOff,
+  Copy, Cpu, Laptop, Link2, LogOut, Monitor, Radio, Smartphone, Tablet, Users, Wifi, WifiOff,
 } from 'lucide-react'
 import { GridField } from '@/ui/fx/GridField'
 import { AnimatedBeam } from '@/ui/fx/AnimatedBeam'
@@ -330,6 +330,18 @@ function PeerList({ peers }: { peers: MeshPeer[] }) {
                 />
                 <span className="min-w-0 flex-1 truncate text-[14px] font-medium">{p.label}</span>
                 {p.capability?.hasWebGpu === false && <Chip tone="warn">no webgpu</Chip>}
+              </div>
+
+              {/* What that device has in memory is the thing that decides
+                  whether it can take a turn, so it belongs on the card. */}
+              <div className="mt-2 flex items-center gap-1.5 text-[11.5px]">
+                {p.loaded ? (
+                  <Chip tone="good" icon={<Cpu size={11} />}>
+                    {p.loaded.label}
+                  </Chip>
+                ) : (
+                  <span className="text-mute">no model loaded — can't take a turn yet</span>
+                )}
               </div>
 
               {p.capability && (

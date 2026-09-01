@@ -1,6 +1,7 @@
 import { DEVICE_DB, type DeviceSpec } from './deviceDb'
 import type { BenchResult } from './bench'
 import type { DeviceProbe } from './types'
+import type { ThermalProfile } from '@/planner/thermal'
 
 /**
  * The single record the planner consumes and the mesh gossips. Every field
@@ -39,6 +40,12 @@ export interface Capability {
   bench: BenchResult | null
   /** Recalibrated from real generations. See planner/roofline. */
   calibration: { decodeEff: number; prefillEff: number; samples: number } | null
+  /**
+   * How this device holds up under sustained load. Absent until a long enough
+   * run has been watched, at which point the planner stops using the prior for
+   * its class — see planner/thermal.
+   */
+  thermal?: ThermalProfile
 }
 
 const GB = 1024 ** 3

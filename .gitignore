@@ -6,3 +6,4 @@ dev-dist
 .venv
 __pycache__
 tools/shard/out
+*.tsbuildinfo

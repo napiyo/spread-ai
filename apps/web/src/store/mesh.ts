@@ -5,7 +5,8 @@ import { generateRoomCode, normaliseRoomCode, type SignalState } from '@/mesh/tr
 import { MeshSyncProvider } from '@/sync/meshProvider'
 import { useDevice } from './device'
 import { useEngine } from './engine'
-import type { GenerateParams } from '@/mesh/protocol'
+import { serveWork, type ServeEngine } from '@/mesh/serve'
+import type { LoadedModel } from '@/mesh/protocol'
 
 const ROOM_KEY = 'spreadai.room'
 const PEER_KEY = 'spreadai.peer'
@@ -49,6 +50,16 @@ interface MeshState {
   refresh: () => void
 }
 
+/** Torn down on leave: the announcer subscription and the greeting timer. */
+let teardown: (() => void)[] = []
+
+/** What we tell the room we have in memory. Null while nothing is loaded. */
+function localLoaded(): LoadedModel | null {
+  const { status, model } = useEngine.getState()
+  if (status !== 'ready' || !model) return null
+  return { id: model.id, label: model.label, contextWindow: model.contextWindow }
+}
+
 export const useMeshStore = create<MeshState>((set, get) => ({
   mesh: null,
   provider: null,
@@ -73,13 +84,17 @@ export const useMeshStore = create<MeshState>((set, get) => ({
 
     const peerId = sessionPeerId(capability.deviceId)
     const signaler = new WsSignaler(signalUrl(), room, peerId)
-    const mesh = new Mesh(signaler, { label: capability.label, capability })
+    const mesh = new Mesh(signaler, {
+      label: capability.label,
+      capability,
+      loaded: localLoaded(),
+    })
 
     mesh.onChange = () => get().refresh()
     mesh.onSignalState = (signalState) => set({ signalState })
     mesh.onError = (error) => set({ error })
 
-    registerHandlers(mesh)
+    teardown.push(serveWork(mesh, engineFacade))
     const provider = new MeshSyncProvider(mesh)
 
     set({ mesh, provider, room, error: null })
@@ -110,9 +125,25 @@ export const useMeshStore = create<MeshState>((set, get) => ({
       known = new Set([...known].filter((id) => current.list().some((p) => p.peerId === id)))
       get().refresh()
     }, 1000)
+    teardown.push(() => clearInterval(tick))
+
+    // Loading or dropping a model changes what this device can do for the
+    // others, so the room is told the moment it happens rather than the next
+    // time somebody asks.
+    let announced = localLoaded()?.id ?? null
+    const unsubscribeEngine = useEngine.subscribe(() => {
+      const loaded = localLoaded()
+      if ((loaded?.id ?? null) === announced) return
+      announced = loaded?.id ?? null
+      const cap = useDevice.getState().capability
+      if (cap) mesh.updateSelf({ label: cap.label, capability: cap, loaded })
+    })
+    teardown.push(unsubscribeEngine)
   },
 
   leave() {
+    for (const off of teardown) off()
+    teardown = []
     get().provider?.destroy()
     get().mesh?.close()
     set({ mesh: null, provider: null, peers: [], signalState: 'idle' })
@@ -125,50 +156,33 @@ export const useMeshStore = create<MeshState>((set, get) => ({
 }))
 
 /**
- * What this device is willing to do on behalf of another.
+ * The engine, as the peer-serving code needs to see it.
  *
- * Deliberately narrow: a peer can ask what we are capable of, and can ask us to
- * run a generation on a model *we* already have loaded. It cannot make us
- * download anything or reach outside the tab.
+ * Narrowing it to this shape is what keeps `mesh/serve` free of the stores, and
+ * therefore testable against a fake engine rather than a real GPU.
  */
-function registerHandlers(mesh: Mesh) {
-  mesh.handle('capability', () => useDevice.getState().capability)
+function engineFacade(): ServeEngine {
+  const engine = useEngine.getState()
+  const ready = engine.status === 'ready' ? engine.model : null
 
-  mesh.handle('generate', async (params, from) => {
-    const p = params as GenerateParams
-    const engine = useEngine.getState()
-    if (engine.status !== 'ready') throw new Error('No model is loaded on that device.')
-    if (engine.model?.id !== p.modelId) {
-      throw new Error(`That device has ${engine.model?.label ?? 'nothing'} loaded, not ${p.modelId}.`)
-    }
-
-    let text = ''
-    const result = await engine.generate(
-      {
-        messages: p.messages as { role: 'user' | 'assistant' | 'system'; content: string }[],
-        maxTokens: p.maxTokens,
-        temperature: p.temperature,
-      },
-      (delta) => {
-        text += delta
-        // Stream back as events so the caller sees tokens as they appear
-        // rather than waiting for the whole reply.
-        mesh.broadcast(`gen:${from}`, { delta })
-      },
-    )
-    return result ?? { text, stats: null }
-  })
-
-  mesh.handle('interrupt', () => {
-    void useEngine.getState().interrupt()
-    return true
-  })
-
-  mesh.handle('listCachedModels', async () => {
-    // Which models this device already has on disk, so a peer can pull weights
-    // from it instead of the internet.
-    if (!('caches' in globalThis)) return []
-    const names = await caches.keys()
-    return names.filter((n) => /webllm|mlc|transformers/i.test(n))
-  })
+  return {
+    deviceLabel: useDevice.getState().capability?.label ?? 'that device',
+    loadedModelId: ready?.id ?? null,
+    loadedModelLabel: ready?.label ?? null,
+    busy: engine.generating,
+    generate: (params, onToken) =>
+      engine.generate(
+        {
+          messages: params.messages as { role: 'user' | 'assistant' | 'system'; content: string }[],
+          maxTokens: params.maxTokens,
+          temperature: params.temperature,
+          topP: params.topP,
+          seed: params.seed,
+        },
+        onToken,
+      ),
+    lastError: () => useEngine.getState().error?.message ?? null,
+    interrupt: () => void useEngine.getState().interrupt(),
+    capability: () => useDevice.getState().capability,
+  }
 }

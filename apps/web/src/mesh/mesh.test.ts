@@ -181,7 +181,7 @@ describe('capability gossip', () => {
     const { mesh, deliver } = meshWithFakePeer()
     await deliver({
       k: 'hello',
-      info: { peerId: 'other', label: 'iPhone 17 Pro', capability: CAP },
+      info: { peerId: 'other', label: 'iPhone 17 Pro', capability: CAP, loaded: null },
     })
     expect(mesh.list()[0].label).toBe('iPhone 17 Pro')
     expect(mesh.labelOf('other')).toBe('iPhone 17 Pro')
@@ -191,6 +191,80 @@ describe('capability gossip', () => {
     const { outbound, deliver } = meshWithFakePeer()
     await deliver({ k: 'ping', t: 1234 })
     expect(outbound.at(-1)).toEqual({ k: 'pong', t: 1234 })
+  })
+
+  it('carries which model a device has loaded, so the chat knows who can serve', async () => {
+    const { mesh, deliver } = meshWithFakePeer()
+    await deliver({
+      k: 'hello',
+      info: {
+        peerId: 'other', label: 'Studio', capability: CAP,
+        loaded: { id: 'Llama-3.2-1B', label: 'Llama 3.2 1B', contextWindow: 4096 },
+      },
+    })
+    expect(mesh.list()[0].loaded?.id).toBe('Llama-3.2-1B')
+  })
+
+  it('keeps the measured round trip when a device re-announces itself', async () => {
+    const { mesh, deliver } = meshWithFakePeer()
+    await deliver({ k: 'ping', t: 0 })
+    await deliver({ k: 'pong', t: performance.now() - 12 })
+    const before = mesh.list()[0].rttMs
+    expect(before).not.toBeNull()
+
+    // Loading a model re-sends hello. Treating that as a brand new peer would
+    // throw away everything we measured about the link.
+    await deliver({
+      k: 'hello',
+      info: {
+        peerId: 'other', label: 'Studio', capability: CAP,
+        loaded: { id: 'Llama-3.2-1B', label: 'Llama 3.2 1B', contextWindow: 4096 },
+      },
+    })
+    expect(mesh.list()[0].rttMs).toBe(before)
+  })
+})
+
+describe('events', () => {
+  it('sends a token stream to the one device that asked, not the room', () => {
+    const { mesh, outbound } = meshWithFakePeer()
+    mesh.emit('other', 'gen', { runId: 'r1', delta: 'hi' })
+    expect(outbound.at(-1)).toEqual({ k: 'ev', topic: 'gen', data: { runId: 'r1', delta: 'hi' } })
+
+    // Nothing goes anywhere when that device is gone, and it does not throw.
+    expect(mesh.emit('nobody', 'gen', { runId: 'r1', delta: 'hi' })).toBe(false)
+  })
+
+  it('delivers an event to its subscribers with the sender attached', async () => {
+    const { mesh, deliver } = meshWithFakePeer()
+    const seen: [unknown, string][] = []
+    mesh.subscribe('gen', (data, from) => seen.push([data, from]))
+    await deliver({ k: 'ev', topic: 'gen', data: { runId: 'r1', delta: 'hi' } })
+    expect(seen).toEqual([[{ runId: 'r1', delta: 'hi' }, 'other']])
+  })
+})
+
+describe('per-call deadlines', () => {
+  it('lets a generation run far longer than a question about hardware', async () => {
+    const { mesh } = meshWithFakePeer()
+    const quick = mesh.call('other', 'capability')
+    const long = mesh.call('other', 'generate', {}, { timeoutMs: 600_000 })
+    const quickFails = expect(quick).rejects.toThrow(/did not answer in time/)
+
+    await vi.advanceTimersByTimeAsync(31_000)
+    await quickFails
+
+    // The generation is still going at the point the default would have killed it.
+    let settled = false
+    void long.catch(() => {
+      settled = true
+    })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    const longFails = expect(long).rejects.toThrow(/did not answer in time/)
+    await vi.advanceTimersByTimeAsync(600_000)
+    await longFails
   })
 })
 
