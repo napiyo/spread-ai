@@ -1,6 +1,6 @@
 import { Peer, type PeerState } from './peer'
 import type { Signaler, SignalState } from './transport'
-import type { Envelope, PeerInfo } from './protocol'
+import type { Envelope, LoadedModel, PeerInfo } from './protocol'
 import type { Capability } from '@/capability/identify'
 
 export interface MeshPeer extends PeerInfo {
@@ -10,6 +10,13 @@ export interface MeshPeer extends PeerInfo {
 }
 
 export type RpcHandler = (params: unknown, from: string) => unknown | Promise<unknown>
+
+/** What this device tells the room about itself. */
+export interface SelfInfo {
+  label: string
+  capability: Capability
+  loaded?: LoadedModel | null
+}
 
 const RPC_TIMEOUT_MS = 30_000
 
@@ -39,7 +46,7 @@ export class Mesh {
 
   constructor(
     private readonly signaler: Signaler,
-    private self: { label: string; capability: Capability },
+    private self: SelfInfo,
   ) {
     signaler.onStateChange = (s) => this.onSignalState?.(s)
     signaler.onExistingPeers = (ids) => {
@@ -110,6 +117,7 @@ export class Mesh {
         peerId: this.signaler.peerId,
         label: this.self.label,
         capability: this.self.capability,
+        loaded: this.self.loaded ?? null,
       },
     })
   }
@@ -124,7 +132,15 @@ export class Mesh {
   private async onEnvelope(from: string, env: Envelope) {
     switch (env.k) {
       case 'hello': {
-        this.info.set(from, { ...env.info, rttMs: null, joinedAt: Date.now() })
+        // A hello arrives again whenever that device loads or drops a model, so
+        // the parts we measured ourselves have to survive the update.
+        const previous = this.info.get(from)
+        this.info.set(from, {
+          ...env.info,
+          loaded: env.info.loaded ?? null,
+          rttMs: previous?.rttMs ?? null,
+          joinedAt: previous?.joinedAt ?? Date.now(),
+        })
         this.onChange?.()
         break
       }
@@ -185,8 +201,20 @@ export class Mesh {
     return () => this.handlers.delete(method)
   }
 
-  /** Calls a method on another device and waits for its answer. */
-  call<T = unknown>(peerId: string, method: string, params?: unknown): Promise<T> {
+  /**
+   * Calls a method on another device and waits for its answer.
+   *
+   * The deadline is per call because the methods are not alike: asking what a
+   * device is takes milliseconds, and asking it to write four hundred tokens on
+   * a phone can take minutes. One number for both either hangs the UI or kills
+   * real work halfway through.
+   */
+  call<T = unknown>(
+    peerId: string,
+    method: string,
+    params?: unknown,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<T> {
     const peer = this.peers.get(peerId)
     if (!peer || peer.state !== 'connected') {
       return Promise.reject(new Error(`${this.labelOf(peerId)} is not connected.`))
@@ -198,7 +226,7 @@ export class Mesh {
       const timer = setTimeout(() => {
         this.pending.delete(id)
         reject(new Error(`${this.labelOf(peerId)} did not answer in time.`))
-      }, RPC_TIMEOUT_MS)
+      }, opts.timeoutMs ?? RPC_TIMEOUT_MS)
 
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer })
       if (!peer.send({ k: 'req', id, method, params })) {
@@ -211,6 +239,17 @@ export class Mesh {
 
   broadcast(topic: string, data: unknown) {
     for (const peer of this.peers.values()) peer.send({ k: 'ev', topic, data })
+  }
+
+  /**
+   * An event for exactly one device.
+   *
+   * Streaming tokens is the reason this exists: a broadcast would hand every
+   * other device in the room a copy of a reply it never asked for, which is a
+   * privacy leak inside a project whose whole claim is that prompts stay put.
+   */
+  emit(peerId: string, topic: string, data: unknown): boolean {
+    return this.peers.get(peerId)?.send({ k: 'ev', topic, data }) ?? false
   }
 
   /** Raw frame used by the CRDT provider, which has its own binary encoding. */
@@ -242,6 +281,7 @@ export class Mesh {
         peerId: id,
         label: info?.label ?? 'Connecting…',
         capability: info?.capability as never,
+        loaded: info?.loaded ?? null,
         rttMs: peer.rttMs,
         joinedAt: info?.joinedAt ?? Date.now(),
         state: peer.state,
@@ -254,9 +294,12 @@ export class Mesh {
     return this.info.get(peerId)?.label ?? 'that device'
   }
 
-  updateSelf(self: { label: string; capability: Capability }) {
+  /** Re-announces this device to everyone. Cheap, and idempotent by design. */
+  updateSelf(self: SelfInfo) {
     this.self = self
-    for (const id of this.peers.keys()) this.sayHello(id)
+    for (const id of this.peers.keys()) {
+      if (this.peers.get(id)?.state === 'connected') this.sayHello(id)
+    }
   }
 
   private drop(id: string) {

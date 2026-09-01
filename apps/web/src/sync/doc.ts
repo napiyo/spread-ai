@@ -14,7 +14,8 @@ import { Awareness } from 'y-protocols/awareness'
  *   threads : Y.Map<threadId, Y.Map>
  *     ├ id, title, createdAt, updatedAt, modelId, modelLabel
  *     └ messages : Y.Array<Y.Map>
- *          └ id, role, createdAt, deviceLabel, stats, text: Y.Text
+ *          └ id, role, createdAt, deviceLabel, stats, strategy,
+ *            candidates, shown, progress, text: Y.Text
  *   prefs   : Y.Map
  */
 
@@ -31,15 +32,37 @@ export const whenSynced: Promise<void> = new Promise((resolve) => {
   persistence.once('synced', () => resolve())
 })
 
+export interface MessageStats {
+  tokensPerSec: number
+  ttftMs: number
+  completionTokens: number
+}
+
+/** One sample of a reply, when several devices drew one at the same time. */
+export interface MessageCandidate {
+  deviceLabel: string
+  text: string
+  stats?: MessageStats
+  error?: string
+}
+
 export interface MessageView {
   id: string
   role: 'user' | 'assistant' | 'system'
   content: string
   createdAt: number
   deviceLabel?: string
-  stats?: { tokensPerSec: number; ttftMs: number; completionTokens: number }
+  stats?: MessageStats
   /** Set while a reply is still arriving. */
   streaming?: boolean
+  /** What the fleet is doing right now, for turns that take several steps. */
+  progress?: string
+  /** How this reply was produced, e.g. "split 3 ways". */
+  strategy?: string
+  /** Every sample drawn, when more than one was. */
+  candidates?: MessageCandidate[]
+  /** Which candidate is currently shown. */
+  shown?: number
   error?: string
 }
 
@@ -134,17 +157,84 @@ export function appendText(threadId: string, messageId: string, delta: string) {
   text.insert(text.length, delta)
 }
 
+/**
+ * What the fleet is doing right now.
+ *
+ * Written into the document rather than kept in component state so that a
+ * second device watching the same thread sees "reading part 3 of 4" too,
+ * instead of an answer that appears out of nowhere a minute later.
+ */
+export function setMessageProgress(threadId: string, messageId: string, progress: string | null) {
+  const m = findMessage(threadId, messageId)
+  if (!m) return
+  if (progress) m.set('progress', progress)
+  else m.delete('progress')
+}
+
 export function finishMessage(
   threadId: string,
   messageId: string,
-  patch: { stats?: MessageView['stats']; error?: string } = {},
+  patch: {
+    stats?: MessageStats
+    error?: string
+    deviceLabel?: string
+    strategy?: string
+    candidates?: MessageCandidate[]
+    shown?: number
+    /**
+     * The final text, when it is not what was streamed — a sample whose device
+     * died halfway through leaves a fragment in the document that has to go.
+     */
+    text?: string
+  } = {},
 ) {
   const m = findMessage(threadId, messageId)
   if (!m) return
   ydoc.transact(() => {
     m.delete('streaming')
+    m.delete('progress')
+
+    const text = m.get('text') as Y.Text
+    if (patch.text != null && patch.text !== text.toString()) {
+      text.delete(0, text.length)
+      text.insert(0, patch.text)
+    }
+
     if (patch.stats) m.set('stats', patch.stats)
     if (patch.error) m.set('error', patch.error)
+    if (patch.deviceLabel) m.set('deviceLabel', patch.deviceLabel)
+    if (patch.strategy) m.set('strategy', patch.strategy)
+    // Only worth keeping when there is actually a choice to make.
+    if (patch.candidates && patch.candidates.length > 1) {
+      m.set('candidates', patch.candidates)
+      m.set('shown', patch.shown ?? 0)
+    }
+    threads.get(threadId)?.set('updatedAt', Date.now())
+  })
+}
+
+/**
+ * Switches a best-of-n reply to a different sample.
+ *
+ * The text is a Y.Text, so this is a replace rather than a new message: the
+ * conversation keeps one reply in one place, and the swap merges on every
+ * device rather than producing two divergent transcripts.
+ */
+export function chooseCandidate(threadId: string, messageId: string, index: number) {
+  const m = findMessage(threadId, messageId)
+  if (!m) return
+  const candidates = m.get('candidates') as MessageCandidate[] | undefined
+  const pick = candidates?.[index]
+  if (!pick || pick.error) return
+
+  ydoc.transact(() => {
+    const text = m.get('text') as Y.Text
+    text.delete(0, text.length)
+    text.insert(0, pick.text)
+    m.set('shown', index)
+    m.set('deviceLabel', pick.deviceLabel)
+    if (pick.stats) m.set('stats', pick.stats)
+    else m.delete('stats')
     threads.get(threadId)?.set('updatedAt', Date.now())
   })
 }
@@ -166,8 +256,12 @@ function toMessageView(m: Y.Map<unknown>): MessageView {
     content: (m.get('text') as Y.Text)?.toString() ?? '',
     createdAt: (m.get('createdAt') as number) ?? 0,
     deviceLabel: m.get('deviceLabel') as string | undefined,
-    stats: m.get('stats') as MessageView['stats'],
+    stats: m.get('stats') as MessageStats | undefined,
     streaming: Boolean(m.get('streaming')),
+    progress: m.get('progress') as string | undefined,
+    strategy: m.get('strategy') as string | undefined,
+    candidates: m.get('candidates') as MessageCandidate[] | undefined,
+    shown: m.get('shown') as number | undefined,
     error: m.get('error') as string | undefined,
   }
 }

@@ -1,11 +1,16 @@
 import { useSyncExternalStore } from 'react'
+import { create } from 'zustand'
 import {
-  appendMessage, appendText, createThread, deleteThread, finishMessage,
-  observeDoc, readThread, readThreadList, setThreadModel, whenSynced,
-  type ThreadView,
+  appendMessage, appendText, chooseCandidate, createThread, deleteThread, finishMessage,
+  observeDoc, readThread, readThreadList, setMessageProgress, setThreadModel, whenSynced,
+  type MessageCandidate, type ThreadView,
 } from '@/sync/doc'
-import { useDevice } from './device'
 import { useEngine } from './engine'
+import { currentWorkers } from './workers'
+import {
+  planTurn, runStrategy, strategyLabel,
+  type Choice, type Strategy, type Worker,
+} from '@/strategies'
 import type { ChatMessage } from '@/runtime/types'
 
 /* ── React bindings over the CRDT ─────────────────────────────────────── */
@@ -59,10 +64,47 @@ export const chatReady = whenSynced
 
 /* ── Actions ──────────────────────────────────────────────────────────── */
 
-export { createThread, deleteThread }
+export { createThread, deleteThread, chooseCandidate }
 
 const SYSTEM_PROMPT =
   'You are a helpful assistant running entirely inside the user\'s web browser. Be concise.'
+
+/**
+ * The turn currently in flight, so the stop button can reach whichever devices
+ * are actually doing the work — which is not necessarily this one.
+ */
+let inFlight: { strategy: Strategy } | null = null
+
+interface TurnState {
+  running: boolean
+  /** Where this turn is being run, in words, while it is running. */
+  where: string | null
+}
+
+/**
+ * Whether a turn is in flight anywhere in the fleet.
+ *
+ * The engine's own `generating` flag is not enough any more: a turn can be
+ * running on three other devices while this one sits idle, and the composer
+ * still has to be closed and the stop button still has to work.
+ */
+export const useTurn = create<TurnState>(() => ({ running: false, where: null }))
+
+/**
+ * Which model the fleet should use for this turn.
+ *
+ * A device that was named explicitly decides, because picking a device and then
+ * being told it has the wrong model loaded is nonsense. Otherwise whatever is
+ * loaded here wins, and failing that the first peer that has anything — which is
+ * what lets a laptop with no model chat through a desktop that has one.
+ */
+function modelForTurn(workers: Worker[], choice: Choice): string | null {
+  if (choice.kind === 'single' && choice.workerId) {
+    return workers.find((w) => w.id === choice.workerId)?.modelId ?? null
+  }
+  const here = workers.find((w) => w.local)
+  return here?.modelId ?? workers.find((w) => w.modelId)?.modelId ?? null
+}
 
 /**
  * Sends a turn and streams the reply into the document.
@@ -71,16 +113,36 @@ const SYSTEM_PROMPT =
  * so a device that joins mid-answer sees the reply filling in rather than
  * nothing at all.
  */
-export async function sendTurn(threadId: string, content: string): Promise<void> {
-  const engine = useEngine.getState()
-  const model = engine.model
-  if (!model || engine.status !== 'ready' || engine.generating) return
+export async function sendTurn(
+  threadId: string,
+  content: string,
+  choice: Choice = { kind: 'auto' },
+): Promise<void> {
+  if (inFlight) return
 
-  const deviceLabel = useDevice.getState().capability?.label
-  setThreadModel(threadId, model.id, model.label)
+  const workers = currentWorkers()
+  const modelId = modelForTurn(workers, choice)
+  const plan = planTurn({ workers, modelId, content, choice })
+
+  // A refusal is an answer. Writing it into the transcript as the reply keeps
+  // the reason attached to the message that provoked it, instead of flashing it
+  // somewhere else and losing it.
+  if (!plan.ok) {
+    appendMessage(threadId, 'user', content)
+    const id = appendMessage(threadId, 'assistant', '')
+    finishMessage(threadId, id, { error: plan.reason })
+    return
+  }
+
+  const { strategy } = plan
+  const lead = strategy.workers[0]
+  if (lead.modelId) setThreadModel(threadId, lead.modelId, lead.modelLabel ?? lead.modelId)
 
   appendMessage(threadId, 'user', content)
-  const replyId = appendMessage(threadId, 'assistant', '', { deviceLabel, streaming: true })
+  const replyId = appendMessage(threadId, 'assistant', '', {
+    deviceLabel: strategy.workers[0].label,
+    streaming: true,
+  })
 
   const thread = readThread(threadId)
   const history: ChatMessage[] = [
@@ -90,21 +152,69 @@ export async function sendTurn(threadId: string, content: string): Promise<void>
       .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content })),
   ]
 
-  const result = await engine.generate({ messages: history }, (delta) =>
-    appendText(threadId, replyId, delta),
-  )
+  inFlight = { strategy }
+  useTurn.setState({
+    running: true,
+    where: strategy.workers.map((w) => w.label).join(', '),
+  })
+  try {
+    const outcome = await runStrategy(strategy, {
+      messages: history,
+      content,
+      onToken: (delta) => appendText(threadId, replyId, delta),
+      onStep: (step) =>
+        setMessageProgress(
+          threadId,
+          replyId,
+          step.done && step.step === step.steps - 1 ? null : step.label,
+        ),
+    })
 
-  if (result) {
     finishMessage(threadId, replyId, {
-      stats: {
-        tokensPerSec: result.stats.decodeTokPerSec,
-        ttftMs: result.stats.ttftMs,
-        completionTokens: result.stats.completionTokens,
-      },
+      deviceLabel: outcome.deviceLabel,
+      strategy: strategyLabel(strategy.kind, strategy.workers.length),
+      // Reconciles the transcript with the answer that actually won, which is
+      // not always the one whose tokens were being streamed into it.
+      text: outcome.text,
+      shown: outcome.shownIndex,
+      stats: outcome.stats
+        ? {
+            tokensPerSec: outcome.stats.decodeTokPerSec,
+            ttftMs: outcome.stats.ttftMs,
+            completionTokens: outcome.stats.completionTokens,
+          }
+        : undefined,
+      candidates: outcome.candidates?.map(
+        (c): MessageCandidate => ({
+          deviceLabel: c.deviceLabel,
+          text: c.text,
+          error: c.error,
+          stats: c.stats
+            ? {
+                tokensPerSec: c.stats.decodeTokPerSec,
+                ttftMs: c.stats.ttftMs,
+                completionTokens: c.stats.completionTokens,
+              }
+            : undefined,
+        }),
+      ),
     })
-  } else {
+  } catch (e) {
     finishMessage(threadId, replyId, {
-      error: useEngine.getState().error?.message ?? 'Generation failed.',
+      error: e instanceof Error ? e.message : String(e),
     })
+  } finally {
+    inFlight = null
+    useTurn.setState({ running: false, where: null })
   }
+}
+
+/** Stops whatever is running, wherever it is running. */
+export async function stopTurn(): Promise<void> {
+  const running = inFlight
+  if (!running) {
+    await useEngine.getState().interrupt()
+    return
+  }
+  await Promise.all(running.strategy.workers.map((w) => w.interrupt().catch(() => {})))
 }
